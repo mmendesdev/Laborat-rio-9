@@ -1,8 +1,3 @@
-"""
-LAB 09 – Arquitetura RAG Avançada: HNSW + HyDE + Cross-Encoder
-Assistente de Busca em Manuais Médicos
-"""
-
 from __future__ import annotations
 
 import os
@@ -16,26 +11,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Configurações globais
-# ────────────────────────────────────────────────────────────────────────────────
 EMBEDDING_MODEL      = "text-embedding-3-small"
 LLM_MODEL            = "gpt-4o-mini"
 CROSS_ENCODER_MODEL  = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 EMBEDDING_DIM        = 1536
 
-HNSW_M               = 32    # nº de vizinhos por nó – afeta recall e RAM
-HNSW_EF_CONSTRUCTION = 200   # qualidade da construção do grafo
-HNSW_EF_SEARCH       = 50    # amplitude da busca em tempo de consulta
+HNSW_M               = 32
+HNSW_EF_CONSTRUCTION = 200
+HNSW_EF_SEARCH       = 50
 
-TOP_K_RETRIEVE       = 10    # funil largo (Bi-Encoder)
-TOP_K_RERANK         = 3     # funil fino  (Cross-Encoder)
+TOP_K_RETRIEVE       = 10
+TOP_K_RERANK         = 3
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Base de Conhecimento: 24 fragmentos de manuais médicos técnicos
-# ────────────────────────────────────────────────────────────────────────────────
 MEDICAL_FRAGMENTS: list[dict] = [
     {
         "id": 0,
@@ -280,21 +269,12 @@ MEDICAL_FRAGMENTS: list[dict] = [
 ]
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Utilitário de impressão formatada
-# ────────────────────────────────────────────────────────────────────────────────
-
 def _print_block(text: str, indent: str = "  │  ", width: int = 62) -> None:
     for line in textwrap.wrap(text, width=width):
         print(f"{indent}{line}")
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Passo 1 – Embeddings e Índice HNSW
-# ────────────────────────────────────────────────────────────────────────────────
-
 def get_embeddings(texts: list[str]) -> np.ndarray:
-    """Gera embeddings densos via OpenAI text-embedding-3-small (1536 dims)."""
     response = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
     return np.array([item.embedding for item in response.data], dtype=np.float32)
 
@@ -305,19 +285,6 @@ def _l2_normalize(vectors: np.ndarray) -> np.ndarray:
 
 
 def build_hnsw_index(embeddings: np.ndarray) -> faiss.IndexHNSWFlat:
-    """
-    Constrói índice HNSW com métrica de produto interno (equivalente à
-    Similaridade de Cosseno para vetores normalizados em L2).
-
-    Hiperparâmetros relevantes:
-      M               – número de vizinhos por nó nas camadas do grafo. Maior M
-                        implica mais arestas, mais RAM e melhor recall.
-      efConstruction  – amplitude do beam-search durante a construção. Maior
-                        valor = grafo de maior qualidade, build mais lento.
-                        NÃO altera o tamanho final do índice em disco/RAM.
-      efSearch        – amplitude do beam-search em tempo de consulta. Aumenta
-                        recall a custo de maior latência por query.
-    """
     dim = embeddings.shape[1]
     index = faiss.IndexHNSWFlat(dim, HNSW_M, faiss.METRIC_INNER_PRODUCT)
     index.hnsw.efConstruction = HNSW_EF_CONSTRUCTION
@@ -326,18 +293,7 @@ def build_hnsw_index(embeddings: np.ndarray) -> faiss.IndexHNSWFlat:
     return index
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Passo 2 – HyDE: Geração do Documento Hipotético
-# ────────────────────────────────────────────────────────────────────────────────
-
 def generate_hypothetical_document(user_query: str) -> str:
-    """
-    Transforma uma query coloquial em um documento técnico hipotético (HyDE).
-
-    O documento falso gerado pelo LLM serve como âncora geométrica no espaço
-    vetorial dos manuais, reduzindo o gap semântico entre a linguagem leiga do
-    paciente e o jargão clínico dos textos indexados.
-    """
     system_prompt = (
         "Você é um médico especialista redator de manuais clínicos. "
         "Dado um relato de sintoma do paciente, escreva um trecho de 3 a 5 frases "
@@ -357,47 +313,28 @@ def generate_hypothetical_document(user_query: str) -> str:
     return response.choices[0].message.content.strip()
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Passo 3 – Recuperação via Bi-Encoder (HNSW)
-# ────────────────────────────────────────────────────────────────────────────────
-
 def retrieve_top_k(
     hypothetical_doc: str,
     index: faiss.IndexHNSWFlat,
     k: int = TOP_K_RETRIEVE,
 ) -> list[dict]:
-    """
-    Recupera os top-k fragmentos mais similares utilizando o vetor do documento
-    hipotético como âncora de busca no índice HNSW (funil largo / bi-encoder).
-    """
     query_vec = _l2_normalize(get_embeddings([hypothetical_doc]))
     scores, indices = index.search(query_vec, k)
 
     results = []
     for score, idx in zip(scores[0], indices[0]):
-        if idx >= 0:                               # FAISS retorna -1 em índices inválidos
+        if idx >= 0:  # FAISS retorna -1 quando o índice não tem vizinhos suficientes
             doc = dict(MEDICAL_FRAGMENTS[idx])
             doc["bi_score"] = float(score)
             results.append(doc)
     return results
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Passo 4 – Re-ranking com Cross-Encoder
-# ────────────────────────────────────────────────────────────────────────────────
-
 def rerank_with_cross_encoder(
     original_query: str,
     candidates: list[dict],
     top_n: int = TOP_K_RERANK,
 ) -> list[dict]:
-    """
-    Re-ranqueia os candidatos via cross-encoder de atenção profunda.
-
-    O modelo recebe o par concatenado [CLS] query [SEP] documento [SEP] e calcula
-    um score de relevância com atenção cruzada bidirecional — muito mais preciso
-    que a similaridade de cosseno independente do bi-encoder, porém mais lento.
-    """
     cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
     pairs  = [[original_query, doc["text"]] for doc in candidates]
     scores = cross_encoder.predict(pairs)
@@ -409,12 +346,7 @@ def rerank_with_cross_encoder(
     return reranked[:top_n]
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Pipeline Principal
-# ────────────────────────────────────────────────────────────────────────────────
-
 def run_rag_pipeline(user_query: str) -> list[dict]:
-    """Executa o pipeline RAG completo em 4 passos e retorna os top-3 documentos."""
     W = 70
 
     print(f"\n{'═' * W}")
@@ -422,7 +354,6 @@ def run_rag_pipeline(user_query: str) -> list[dict]:
     print(f"{'═' * W}")
     print(f"\n  Query coloquial do usuário: \"{user_query}\"")
 
-    # ── Passo 1: Construção do Índice HNSW ──────────────────────────────────────
     print(f"\n{'─' * W}")
     print("  PASSO 1 » Construção e Indexação do Grafo HNSW")
     print(f"{'─' * W}")
@@ -440,7 +371,6 @@ def run_rag_pipeline(user_query: str) -> list[dict]:
     print(f"  ├─ ef_search             : {HNSW_EF_SEARCH}")
     print(f"  └─ Métrica               : Inner Product (≡ Cosseno com L2-norm)")
 
-    # ── Passo 2: HyDE – Documento Hipotético ────────────────────────────────────
     print(f"\n{'─' * W}")
     print("  PASSO 2 » Query Transformation via HyDE")
     print(f"{'─' * W}")
@@ -453,7 +383,6 @@ def run_rag_pipeline(user_query: str) -> list[dict]:
     _print_block(hypothetical_doc, indent="  │  ", width=W - 8)
     print(f"  └{'─' * (W - 4)}")
 
-    # ── Passo 3: Recuperação via Bi-Encoder ─────────────────────────────────────
     print(f"\n{'─' * W}")
     print(f"  PASSO 3 » Busca Rápida via Bi-Encoder no Índice HNSW (Top-{TOP_K_RETRIEVE})")
     print(f"{'─' * W}")
@@ -465,7 +394,6 @@ def run_rag_pipeline(user_query: str) -> list[dict]:
     for rank, doc in enumerate(candidates, 1):
         print(f"  {rank:<4} {doc['bi_score']:<12.4f} {doc['title']}")
 
-    # ── Passo 4: Re-ranking com Cross-Encoder ───────────────────────────────────
     print(f"\n{'─' * W}")
     print(f"  PASSO 4 » Filtro Fino com Cross-Encoder — Top-{TOP_K_RERANK} Finais")
     print(f"{'─' * W}")
@@ -488,15 +416,10 @@ def run_rag_pipeline(user_query: str) -> list[dict]:
     return top_reranked
 
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ────────────────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     if not os.getenv("OPENAI_API_KEY"):
         print("Erro: OPENAI_API_KEY não definida. Crie um arquivo .env com a chave.")
         sys.exit(1)
 
-    # Query de demonstração: linguagem coloquial → jargão médico esperado
     demo_query = "dor de cabeça latejante e luz incomodando"
     run_rag_pipeline(demo_query)
